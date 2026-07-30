@@ -16,10 +16,15 @@ const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 
 // ---- server ---------------------------------------------------------------
 
+// Set by the backpressure check: when true, a new connection is flooded rather
+// than echoed, so the cap can be observed from the outside.
+let flood = null
+
 const app = App()
 app.ws('/*', {
   open: (ws) => {
     if (process.env.VERBOSE) console.log('open')
+    if (flood) flood(ws)
   },
   message: (ws, msg, isBinary) => {
     ws.send(msg, isBinary)
@@ -225,4 +230,71 @@ async function selftest() {
     setTimeout(resolve, 500)
   })
   check('socket closed', true)
+
+  await backpressure(check)
+}
+
+/// The cap is only real if it is observed. A client that never reads makes the
+/// server buffer whatever we hand it, so without a bound this loop would grow
+/// memory until the process died — which is the denial-of-service the cap
+/// exists to close, reachable by any peer that simply stops reading.
+async function backpressure(check) {
+  const MSG = 256 * 1024
+  const ATTEMPTS = 200 // 50 MiB offered, far past any sane cap
+  const results = { accepted: 0, refused: 0, bytes: 0 }
+
+  const done = new Promise((resolve) => {
+    flood = (ws) => {
+      const payload = Buffer.alloc(MSG, 0x5a)
+      for (let i = 0; i < ATTEMPTS; i++) {
+        if (ws.send(payload, true)) {
+          results.accepted++
+          results.bytes += MSG
+        } else {
+          results.refused++
+        }
+      }
+      resolve()
+    }
+  })
+
+  // Connect and then never read a byte: `pause()` before the handshake reply
+  // can be consumed, so the server's outbound buffer has nowhere to drain.
+  const sock = net.connect(PORT, '127.0.0.1')
+  await new Promise((r) => sock.once('connect', r))
+  const key = crypto.randomBytes(16).toString('base64')
+  sock.write(
+    `GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n` +
+      `Connection: Upgrade\r\nSec-WebSocket-Key: ${key}\r\n` +
+      `Sec-WebSocket-Version: 13\r\n\r\n`,
+  )
+  sock.pause()
+  await done
+  flood = null
+
+  const before = process.memoryUsage().rss
+  await new Promise((r) => setTimeout(r, 300))
+  const after = process.memoryUsage().rss
+
+  console.log(
+    `    offered ${(ATTEMPTS * MSG) / 1048576} MiB: ` +
+      `${results.accepted} accepted, ${results.refused} refused, ` +
+      `${(results.bytes / 1048576).toFixed(1)} MiB queued`,
+  )
+  check(
+    'send() refuses once the cap is reached',
+    results.refused > 0,
+    `all ${results.accepted} sends were accepted — nothing bounded the buffer`,
+  )
+  check(
+    'queued bytes stay under the cap',
+    results.bytes <= 8 * 1024 * 1024,
+    `${(results.bytes / 1048576).toFixed(1)} MiB accepted for one stalled peer`,
+  )
+  check(
+    'memory stops growing once the cap is hit',
+    after - before < 16 * 1024 * 1024,
+    `rss grew ${((after - before) / 1048576).toFixed(1)} MiB while idle at the cap`,
+  )
+  sock.destroy()
 }

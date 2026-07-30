@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::io::Write as _;
 use std::os::fd::{IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -48,6 +48,35 @@ use ramjet_ws::{encode, handshake, Decoder, Event};
 /// Autobahn's limit cases run to 16 MiB; sit above that so they echo rather
 /// than get refused, but keep a ceiling so a peer cannot name any size it likes.
 const MAX_MESSAGE: usize = 32 * 1024 * 1024;
+
+/// Most bytes allowed to be outstanding for one connection: queued on the
+/// bridge, or encoded into its outbound buffer and not yet written.
+///
+/// Without a cap this is a denial-of-service path reachable from the network —
+/// a peer that reads slowly, or not at all, makes the server buffer everything
+/// JS produces for it until memory runs out. The tradeoff is the usual one: too
+/// low and a legitimately bursty producer loses messages it could have sent, too
+/// high and one stalled connection can pin the memory anyway. 4 MiB is roughly a
+/// second of a slow-but-alive connection at the sizes an echo-shaped workload
+/// sees, and 1000 stalled connections at the cap is 4 GiB — which is why the
+/// real answer for a fan-out server is a `drain` event and a producer that
+/// listens to it, not a bigger number here.
+const MAX_OUTBOUND: usize = 4 * 1024 * 1024;
+
+/// Bytes `encode::text`/`encode::binary` will actually produce for a payload of
+/// this length: the payload plus a header whose width the length decides.
+/// Counting encoded rather than payload bytes is what keeps the accounting exact
+/// against what leaves in a write.
+fn frame_len(payload: usize) -> usize {
+    payload
+        + if payload < 126 {
+            2
+        } else if payload <= usize::from(u16::MAX) {
+            4
+        } else {
+            10
+        }
+}
 
 const BAD_REQUEST: &[u8] =
     b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
@@ -89,20 +118,79 @@ enum Cmd {
 struct Bridge {
     inner: Mutex<(Sender<Cmd>, UnixStream)>,
     listening: AtomicBool,
+    /// Bytes outstanding per live connection, shared with the reactor thread.
+    ///
+    /// This is what lets `ws.send` answer truthfully without a round trip. The
+    /// outbound buffer lives on the reactor thread and the JS thread cannot see
+    /// it — but it does not need to, because the *same* growth shows up in this
+    /// counter, which both threads can touch: incremented here when a message is
+    /// accepted, decremented by the reactor when those bytes leave. It therefore
+    /// bounds the bridge queue and the outbound buffer together, which matters,
+    /// because a message sitting in the channel is exactly as unbounded as one
+    /// sitting in `Conn::out`.
+    pending: Mutex<HashMap<u64, Arc<AtomicUsize>>>,
 }
 
 impl Bridge {
-    fn send(&self, cmd: Cmd) {
+    /// Queue a command and wake the reactor. Returns whether it was queued.
+    fn send(&self, cmd: Cmd) -> bool {
         let Ok(mut guard) = self.inner.lock() else {
-            return; // reactor thread panicked; nothing to deliver to
+            return false; // reactor thread panicked; nothing to deliver to
         };
         if guard.0.send(cmd).is_err() {
-            return; // reactor is gone
+            return false; // reactor is gone
         }
         // One byte, and its value carries nothing: the reactor drains the whole
         // queue on any wake, so a burst of sends needs no more than one byte to
         // still be delivered in order.
         let _ = guard.1.write_all(&[1]);
+        true
+    }
+
+    /// Charge `bytes` against a connection's budget, or refuse.
+    ///
+    /// The whole check is one compare-and-swap, so two `ws.send` calls racing on
+    /// the JS thread cannot both slip past a nearly-full budget.
+    fn reserve(&self, id: u64, bytes: usize) -> bool {
+        let Ok(map) = self.pending.lock() else {
+            return false;
+        };
+        // No counter means the connection is gone. Dropping is right: the id is
+        // never reused, so this cannot be somebody else's connection.
+        let Some(counter) = map.get(&id) else {
+            return false;
+        };
+        counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                (cur + bytes <= MAX_OUTBOUND).then_some(cur + bytes)
+            })
+            .is_ok()
+    }
+
+    /// Give budget back once bytes have left, or been abandoned.
+    fn release(&self, id: u64, bytes: usize) {
+        if let Ok(map) = self.pending.lock() {
+            if let Some(counter) = map.get(&id) {
+                // Saturating: control frames the reactor generates itself are
+                // never charged (the protocol caps them at 125 bytes each), so a
+                // write can legitimately retire more bytes than were reserved.
+                let _ = counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                    Some(cur.saturating_sub(bytes))
+                });
+            }
+        }
+    }
+
+    fn track(&self, id: u64) {
+        if let Ok(mut map) = self.pending.lock() {
+            map.insert(id, Arc::new(AtomicUsize::new(0)));
+        }
+    }
+
+    fn forget(&self, id: u64) {
+        if let Ok(mut map) = self.pending.lock() {
+            map.remove(&id);
+        }
     }
 }
 
@@ -147,7 +235,7 @@ fn ws_handle(env: &Env, bridge: &Arc<Bridge>, id: u64) -> Result<Object<'static>
     let mut obj = Object::new(env)?;
 
     let b = Arc::clone(bridge);
-    let send: Function<Unknown, ()> =
+    let send: Function<Unknown, bool> =
         env.create_function_from_closure("send", move |cx: FunctionCallContext| {
             let value: Unknown = cx.get(0)?;
             // A string is text and a Buffer is binary; an explicit second argument
@@ -165,8 +253,12 @@ fn ws_handle(env: &Env, bridge: &Arc<Bridge>, id: u64) -> Result<Object<'static>
             if let Ok(flag) = cx.get::<bool>(1) {
                 binary = flag;
             }
-            b.send(Cmd::Send { id, data, binary });
-            Ok(())
+            // Charged before it is queued, so the boolean is about this message
+            // rather than about the one before it.
+            if !b.reserve(id, frame_len(data.len())) {
+                return Ok(false);
+            }
+            Ok(b.send(Cmd::Send { id, data, binary }))
         })?;
     obj.set_named_property("send", send)?;
 
@@ -228,6 +320,7 @@ struct Server {
     by_id: HashMap<u64, RawFd>,
     next_id: u64,
     handlers: Arc<Handlers>,
+    bridge: Arc<Bridge>,
     listener: RawFd,
     wake: RawFd,
 }
@@ -400,6 +493,9 @@ impl Server {
     fn retire(&mut self, fd: RawFd, code: u16) {
         if let Some(conn) = self.conns.remove(&fd) {
             self.by_id.remove(&conn.id);
+            // Drop the budget with the connection, so a `send` on a dead id is
+            // refused rather than charged against a counter nobody will drain.
+            self.bridge.forget(conn.id);
             if conn.opened {
                 if let Some(cb) = &self.handlers.close {
                     cb.call((conn.id, code), ThreadsafeFunctionCallMode::NonBlocking);
@@ -414,6 +510,7 @@ fn reactor_thread(
     wake: RawFd,
     rx: Receiver<Cmd>,
     handlers: Arc<Handlers>,
+    bridge: Arc<Bridge>,
 ) -> std::io::Result<()> {
     let mut s = Server {
         d: PlatformDriver::new()?,
@@ -421,6 +518,7 @@ fn reactor_thread(
         by_id: HashMap::new(),
         next_id: 1,
         handlers,
+        bridge,
         listener,
         wake,
     };
@@ -446,6 +544,7 @@ fn reactor_thread(
                         s.next_id += 1;
                         s.conns.insert(fd, Conn::new(id));
                         s.by_id.insert(id, fd);
+                        s.bridge.track(id);
                         s.d.submit_with(Op::ReadPooled { fd }, tag(KIND_READ, fd))?;
                     }
                     // The pending connection died before we took it, which says
@@ -512,17 +611,27 @@ fn reactor_thread(
 
                 KIND_WRITE => {
                     let fd = tag_fd(c.user);
+                    // These bytes have left the process: give their budget back
+                    // before anything else, so a producer waiting on `send` is
+                    // unblocked as early as it can be.
+                    let written = c.buf.as_ref().map_or(0, |b| b.len());
                     if let Some(buf) = c.buf {
                         s.d.recycle(buf);
                     }
                     let failed = c.result.is_err();
+                    let mut abandoned = 0;
                     if let Some(conn) = s.conns.get_mut(&fd) {
                         conn.writing = false;
                         if failed {
+                            abandoned = conn.out.len();
                             conn.out.clear();
                             conn.close_when_flushed = true;
                             conn.ignoring = true;
                         }
+                    }
+                    if let Some(conn) = s.conns.get(&fd) {
+                        let id = conn.id;
+                        s.bridge.release(id, written + abandoned);
                     }
                     if s.pump(fd)? {
                         s.retire(fd, 1000);
@@ -628,11 +737,12 @@ impl WsApp {
             .take()
             .ok_or_else(|| Error::from_reason("listen() called twice on one App"))?;
         let handlers = Arc::new(std::mem::take(&mut self.handlers));
+        let bridge = Arc::clone(&self.bridge);
 
         thread::Builder::new()
             .name("ramjet-reactor".into())
             .spawn(move || {
-                if let Err(e) = reactor_thread(listener_fd, wake_fd, rx, handlers) {
+                if let Err(e) = reactor_thread(listener_fd, wake_fd, rx, handlers, bridge) {
                     eprintln!("ramjet reactor exited: {e}");
                 }
             })
@@ -655,6 +765,7 @@ pub fn app() -> Result<WsApp> {
         bridge: Arc::new(Bridge {
             inner: Mutex::new((tx, js_end)),
             listening: AtomicBool::new(false),
+            pending: Mutex::new(HashMap::new()),
         }),
         reactor_wake: Some(reactor_end),
         rx: Some(rx),

@@ -53,10 +53,16 @@ surprised.
 | `behavior.open(ws)` | connection established |
 | `behavior.message(ws, msg, isBinary)` | `msg` is a `Buffer` |
 | `behavior.close(ws, code)` | connection gone |
-| `ws.send(data, isBinary)` | `data` may be a string or `Buffer` |
+| `ws.send(data, isBinary)` | `data` may be a string or `Buffer`; returns `false` if the message was dropped because the connection is at its 4 MiB outbound cap |
 | `ws.close()` | close it |
 
-Not implemented yet: pub/sub, backpressure signalling, HTTP routing, TLS
+Outbound buffering is capped per connection at 4 MiB, and `ws.send` returns
+`false` when a message is dropped for exceeding it. That bounds memory against a
+peer that stops reading; it is not the full backpressure contract — there is no
+`drain` event yet, so a producer that wants to resume has to retry rather than be
+told when there is room.
+
+Not implemented yet: pub/sub, `drain`/backpressure signalling, HTTP routing, TLS
 termination, and per-message compression. The Rust runtime supports TLS; the
 binding does not expose it yet.
 
