@@ -1,0 +1,27 @@
+[package]
+name = "ramjet-ws-js"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Node.js WebSocket server bindings for the ramjet runtime"
+repository = "https://github.com/sofelia-ai/ramjet-ws-js"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The engine, straight from crates.io — the same code the benchmarks measured.
+ramjet = "0.1"
+ramjet-ws = "0.1"
+libc = "0.2"
+napi = { version = "2", default-features = false, features = ["napi4", "napi6"] }
+napi-derive = "2"
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"

@@ -1,0 +1,27 @@
+{
+  "name": "ramjet-ws",
+  "version": "0.1.0",
+  "description": "WebSocket server for Node.js on the ramjet runtime — io_uring on Linux, kqueue on macOS",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "license": "MIT OR Apache-2.0",
+  "repository": { "type": "git", "url": "git+https://github.com/sofelia-ai/ramjet-ws-js.git" },
+  "keywords": ["websocket", "server", "io_uring", "performance", "native"],
+  "engines": { "node": ">= 18" },
+  "files": ["index.js", "index.d.ts"],
+  "napi": {
+    "binaryName": "ramjet-ws",
+    "targets": [
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin"
+    ]
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "test": "node examples/echo.js --selftest"
+  },
+  "devDependencies": { "@napi-rs/cli": "^3.0.0" }
+}
