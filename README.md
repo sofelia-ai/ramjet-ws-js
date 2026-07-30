@@ -60,6 +60,29 @@ Not implemented yet: pub/sub, backpressure signalling, HTTP routing, TLS
 termination, and per-message compression. The Rust runtime supports TLS; the
 binding does not expose it yet.
 
+## Building
+
+```sh
+npm install
+npx napi build --platform --release
+node examples/echo.js --selftest
+```
+
+### Known gap: the generated `index.js`
+
+`napi build --platform` is supposed to emit an `index.js` that picks the right
+platform binary and re-exports it. With `napi`/`napi-derive` 2 and
+`@napi-rs/cli` 3 it emits the `.node` and an empty `index.d.ts`, and no
+`index.js` at all — the CLI reads type metadata the v2 derive macro does not
+write in the shape v3 expects. Adding `features = ["type-def"]` to
+`napi-derive` did not change it.
+
+The addon itself is fine: `require('./ramjet-ws.<platform>-<arch>.node')`
+exports `App` and everything works, which is what `examples/echo.js` does when
+the wrapper is missing. Fixing it properly means either pinning
+`@napi-rs/cli` to 2.x or moving the crate to `napi` 3 — a version decision
+rather than a code one, so it is left for whoever owns the release.
+
 ## License
 
 MIT or Apache-2.0, at your option.

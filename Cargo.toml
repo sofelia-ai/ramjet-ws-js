@@ -16,7 +16,7 @@ ramjet = "0.1"
 ramjet-ws = "0.1"
 libc = "0.2"
 napi = { version = "2", default-features = false, features = ["napi4", "napi6"] }
-napi-derive = "2"
+napi-derive = { version = "2", features = ["type-def"] }
 
 [build-dependencies]
 napi-build = "2"
