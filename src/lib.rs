@@ -280,7 +280,7 @@ fn forget_ws(env: &Env, id: u64) {
         if let Some(r) = cache.borrow_mut().remove(&id) {
             // Explicit rather than dropped: `unref` is what tells V8 the object
             // may be collected, and it must happen on this thread.
-            let _ = &r; // MUTATED: skip unref
+            let _ = r.unref(env);
         }
     });
 }
