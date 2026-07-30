@@ -132,16 +132,31 @@ jobs:
           # dependencies, so publishing the root first would briefly point at
           # versions that do not exist yet. No `|| true` anywhere here — a
           # publish that half-fails should stop, not leave npm inconsistent.
-          # Prove the tarball is loadable before it is public: 0.1.1 shipped
-          # without index.js and was installable but impossible to require.
+          # Platform packages first, then the root, so the root's optional
+          # dependencies never point at versions that do not exist yet.
+          for dir in npm/*/; do
+            (cd "$dir" && npm publish --access public)
+          done
+
+          # Injects optionalDependencies into the root package.json. Without it
+          # npm installs the root alone, the loader finds no binding, and
+          # require() throws — which is exactly how 0.1.2 shipped.
+          npx napi pre-publish -t npm --skip-optional-publish
+
+          # Two things 0.1.1 and 0.1.2 each taught us, checked before going out:
+          # the tarball must contain the loader, and the manifest must point at
+          # the platform packages.
           npm pack --silent >/dev/null
           tar tzf ramjet-ws-*.tgz | grep -q 'package/index.js' \
             || { echo "::error::index.js is not in the tarball"; exit 1; }
           rm -f ramjet-ws-*.tgz
+          node -e '
+            const o = require("./package.json").optionalDependencies || {};
+            const n = Object.keys(o).length;
+            if (n === 0) { console.error("::error::root package has no optionalDependencies — the binding would not install"); process.exit(1) }
+            console.log("optionalDependencies:", n, Object.keys(o).join(" "));
+          '
 
-          for dir in npm/*/; do
-            (cd "$dir" && npm publish --access public)
-          done
           npm publish --access public
 
       - name: GitHub release with the raw binaries
