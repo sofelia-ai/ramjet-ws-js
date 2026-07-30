@@ -20,18 +20,23 @@ jobs:
         include:
           # No Windows: the runtime underneath has io_uring and kqueue
           # backends and no IOCP one, so it does not compile there.
-          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-latest }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-latest,    node_arch: x64 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, node_arch: arm64 }
           # Both Mac targets on Apple Silicon runners. macos-13 (Intel) runners
           # are scarce and being retired — a sibling project's release once sat
           # queued 11 minutes for one while every other target finished inside a
           # minute. Rosetta runs the x86_64 self-test, so it stays tested.
-          - { target: x86_64-apple-darwin,       os: macos-latest }
-          - { target: aarch64-apple-darwin,      os: macos-latest }
+          # x64 Node under Rosetta, because an arm64 Node process cannot load
+          # an x86_64 addon at all — the self-test needs a matching runtime,
+          # not just a matching compiler target.
+          - { target: x86_64-apple-darwin,       os: macos-latest,     node_arch: x64 }
+          - { target: aarch64-apple-darwin,      os: macos-latest,     node_arch: arm64 }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 20 }
+        with:
+          node-version: 20
+          architecture: ${{ matrix.node_arch }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
