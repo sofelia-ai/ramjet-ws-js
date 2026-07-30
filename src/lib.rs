@@ -575,7 +575,7 @@ impl WsApp {
             self.handlers.message = Some(
                 f.build_threadsafe_function::<(u64, Vec<u8>, bool)>()
                     .callee_handled::<false>()
-                    .build_callback(move |ctx: ThreadsafeCallContext<(u64, Vec<u8>, bool)>| {
+                    .build_callback(move |ctx: ThreadsafeCallContext<MessageIn>| {
                         let (id, data, binary) = ctx.value;
                         Ok((ws_handle(&ctx.env, &b, id)?, Buffer::from(data), binary).into())
                     })?,
