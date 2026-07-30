@@ -9,16 +9,7 @@
 
 const net = require('node:net')
 const crypto = require('node:crypto')
-// `napi build --platform` is meant to emit an index.js that does this platform
-// dance for us. With napi-derive 2 and @napi-rs/cli 3 it does not (see README),
-// so load the generated wrapper if it is there and the platform binary if not.
-const { App } = (() => {
-  try {
-    return require('../index.js')
-  } catch {
-    return require(`../ramjet-ws.${process.platform}-${process.arch}.node`)
-  }
-})()
+const { App } = require('../index.js')
 
 const PORT = Number(process.env.PORT || 9001)
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'

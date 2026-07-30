@@ -36,9 +36,9 @@ use std::thread;
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{
-    ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode,
+    ThreadsafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode,
 };
-use napi::{CallContext, JsBuffer, JsFunction, JsObject, JsUnknown, ValueType};
+use napi::{Status, ValueType};
 use napi_derive::napi;
 
 use ramjet::net::Listener;
@@ -106,56 +106,81 @@ impl Bridge {
     }
 }
 
-/// A handler that can be called from the reactor thread. `Fatal` because a
-/// throwing handler is a bug in the application, not a condition the reactor
-/// can do anything about.
-type Callback<T> = ThreadsafeFunction<T, ErrorStrategy::Fatal>;
+/// A handler that can be called from the reactor thread.
+///
+/// `CalleeHandled = false` is napi 3's spelling of what napi 2 called
+/// `ErrorStrategy::Fatal`: the reactor passes a value, not a `Result`, because a
+/// throwing handler is a bug in the application rather than a condition the
+/// reactor could do anything about. The args the JS side actually receives are
+/// built in the callback, so they are a separate type from what is sent.
+type Callback<T, Args> = ThreadsafeFunction<T, Unknown<'static>, Args, Status, false>;
+
+/// The `ws` handle every handler receives as its first argument.
+type WsArg = Object<'static>;
+
+/// What the reactor sends for a message, and what JS receives for one. Named
+/// rather than inlined so the `Handlers` fields stay readable.
+type MessageIn = (u64, Vec<u8>, bool);
+type MessageOut = FnArgs<(WsArg, Buffer, bool)>;
+
+/// The same for a close: what the reactor sends, and what JS receives.
+///
+/// `FnArgs` rather than a bare tuple is load-bearing — a plain tuple arrives in
+/// JS as one array-like argument rather than as separate parameters, which
+/// shows up as `ws.send is not a function` when the handler destructures it.
+type CloseIn = (u64, u16);
+type CloseOut = FnArgs<(WsArg, u16)>;
 
 /// Handlers registered from JS, already wrapped for cross-thread calling.
 #[derive(Default)]
 struct Handlers {
-    open: Option<Callback<u64>>,
+    open: Option<Callback<u64, WsArg>>,
     /// Connection id, payload, and whether it arrived as binary.
-    message: Option<Callback<(u64, Vec<u8>, bool)>>,
+    message: Option<Callback<MessageIn, MessageOut>>,
     /// Connection id and close code.
-    close: Option<Callback<(u64, u16)>>,
+    close: Option<Callback<CloseIn, CloseOut>>,
 }
 
 /// Build the `ws` handle JS handlers receive: an object with `send` and
 /// `close`, each closing over the connection id and the bridge.
-fn ws_handle(env: &Env, bridge: &Arc<Bridge>, id: u64) -> Result<JsObject> {
-    let mut obj = env.create_object()?;
+fn ws_handle(env: &Env, bridge: &Arc<Bridge>, id: u64) -> Result<Object<'static>> {
+    let mut obj = Object::new(env)?;
 
     let b = Arc::clone(bridge);
-    let send = env.create_function_from_closure("send", move |cx: CallContext| {
-        let value: JsUnknown = cx.get(0)?;
-        // A string is text and a Buffer is binary; an explicit second argument
-        // overrides both, which is how uWebSockets.js behaves.
-        let (data, mut binary) = match value.get_type()? {
-            ValueType::String => {
-                let s = value.coerce_to_string()?.into_utf8()?;
-                (s.as_str()?.as_bytes().to_vec(), false)
+    let send: Function<Unknown, ()> =
+        env.create_function_from_closure("send", move |cx: FunctionCallContext| {
+            let value: Unknown = cx.get(0)?;
+            // A string is text and a Buffer is binary; an explicit second argument
+            // overrides both, which is how uWebSockets.js behaves.
+            let (data, mut binary) = match value.get_type()? {
+                ValueType::String => {
+                    let s = value.coerce_to_string()?.into_utf8()?;
+                    (s.as_str()?.as_bytes().to_vec(), false)
+                }
+                _ => {
+                    let buf = unsafe { value.cast::<Buffer>()? };
+                    (buf.to_vec(), true)
+                }
+            };
+            if let Ok(flag) = cx.get::<bool>(1) {
+                binary = flag;
             }
-            _ => {
-                let buf = unsafe { value.cast::<JsBuffer>() }.into_value()?;
-                (buf.to_vec(), true)
-            }
-        };
-        if let Ok(flag) = cx.get::<bool>(1) {
-            binary = flag;
-        }
-        b.send(Cmd::Send { id, data, binary });
-        cx.env.get_undefined()
-    })?;
+            b.send(Cmd::Send { id, data, binary });
+            Ok(())
+        })?;
     obj.set_named_property("send", send)?;
 
     let b = Arc::clone(bridge);
-    let close = env.create_function_from_closure("close", move |cx: CallContext| {
-        b.send(Cmd::Close { id });
-        cx.env.get_undefined()
-    })?;
+    let close: Function<Unknown, ()> =
+        env.create_function_from_closure("close", move |_cx: FunctionCallContext| {
+            b.send(Cmd::Close { id });
+            Ok(())
+        })?;
     obj.set_named_property("close", close)?;
-    Ok(obj)
+    // The object is handed straight to a JS handler and never held past the
+    // call, so widening it to 'static here is sound and is what lets it be
+    // returned from the threadsafe callback.
+    Ok(unsafe { std::mem::transmute::<Object<'_>, Object<'static>>(obj) })
 }
 
 /// One client on the reactor thread. Mirrors `examples/ws_echo.rs`: an HTTP
@@ -534,45 +559,38 @@ impl WsApp {
     /// the one handler set. It is in the signature so that code written against
     /// uWebSockets.js does not have to change shape when routing arrives.
     #[napi]
-    pub fn ws(&mut self, _pattern: String, handlers: JsObject) -> Result<()> {
-        if let Ok(f) = handlers.get_named_property::<JsFunction>("open") {
+    pub fn ws(&mut self, _pattern: String, handlers: Object) -> Result<()> {
+        if let Ok(f) = handlers.get_named_property::<Function>("open") {
             let b = Arc::clone(&self.bridge);
-            self.handlers.open = Some(f.create_threadsafe_function(
-                0,
-                move |ctx: ThreadSafeCallContext<u64>| {
-                    Ok(vec![ws_handle(&ctx.env, &b, ctx.value)?])
-                },
-            )?);
+            self.handlers.open = Some(
+                f.build_threadsafe_function::<u64>()
+                    .callee_handled::<false>()
+                    .build_callback(move |ctx: ThreadsafeCallContext<u64>| {
+                        ws_handle(&ctx.env, &b, ctx.value)
+                    })?,
+            );
         }
-        if let Ok(f) = handlers.get_named_property::<JsFunction>("message") {
+        if let Ok(f) = handlers.get_named_property::<Function>("message") {
             let b = Arc::clone(&self.bridge);
-            self.handlers.message = Some(f.create_threadsafe_function(
-                0,
-                move |ctx: ThreadSafeCallContext<(u64, Vec<u8>, bool)>| {
-                    let (id, data, binary) = ctx.value;
-                    let ws = ws_handle(&ctx.env, &b, id)?;
-                    let buf = ctx.env.create_buffer_with_data(data)?.into_raw();
-                    Ok(vec![
-                        ws.into_unknown(),
-                        buf.into_unknown(),
-                        ctx.env.get_boolean(binary)?.into_unknown(),
-                    ])
-                },
-            )?);
+            self.handlers.message = Some(
+                f.build_threadsafe_function::<(u64, Vec<u8>, bool)>()
+                    .callee_handled::<false>()
+                    .build_callback(move |ctx: ThreadsafeCallContext<(u64, Vec<u8>, bool)>| {
+                        let (id, data, binary) = ctx.value;
+                        Ok((ws_handle(&ctx.env, &b, id)?, Buffer::from(data), binary).into())
+                    })?,
+            );
         }
-        if let Ok(f) = handlers.get_named_property::<JsFunction>("close") {
+        if let Ok(f) = handlers.get_named_property::<Function>("close") {
             let b = Arc::clone(&self.bridge);
-            self.handlers.close = Some(f.create_threadsafe_function(
-                0,
-                move |ctx: ThreadSafeCallContext<(u64, u16)>| {
-                    let (id, code) = ctx.value;
-                    let ws = ws_handle(&ctx.env, &b, id)?;
-                    Ok(vec![
-                        ws.into_unknown(),
-                        ctx.env.create_uint32(u32::from(code))?.into_unknown(),
-                    ])
-                },
-            )?);
+            self.handlers.close = Some(
+                f.build_threadsafe_function::<CloseIn>()
+                    .callee_handled::<false>()
+                    .build_callback(move |ctx: ThreadsafeCallContext<CloseIn>| {
+                        let (id, code) = ctx.value;
+                        Ok((ws_handle(&ctx.env, &b, id)?, code).into())
+                    })?,
+            );
         }
         Ok(())
     }
@@ -580,7 +598,7 @@ impl WsApp {
     /// Bind the port and start the reactor. The callback is invoked with
     /// whether the bind succeeded, matching uWebSockets.js.
     #[napi]
-    pub fn listen(&mut self, env: Env, port: u16, callback: JsFunction) -> Result<()> {
+    pub fn listen(&mut self, port: u16, callback: Function<bool, ()>) -> Result<()> {
         if self.bridge.listening.swap(true, Ordering::SeqCst) {
             return Err(Error::from_reason("listen() called twice on one App"));
         }
@@ -590,7 +608,7 @@ impl WsApp {
             Err(_) => {
                 // A bind failure is reported through the callback, not thrown:
                 // that is what uWebSockets.js does and what callers check.
-                callback.call(None, &[env.get_boolean(false)?.into_unknown()])?;
+                callback.call(false)?;
                 return Ok(());
             }
         };
@@ -620,7 +638,7 @@ impl WsApp {
             })
             .map_err(|e| Error::from_reason(format!("reactor thread: {e}")))?;
 
-        callback.call(None, &[env.get_boolean(true)?.into_unknown()])?;
+        callback.call(true)?;
         Ok(())
     }
 }

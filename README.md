@@ -64,24 +64,13 @@ binding does not expose it yet.
 
 ```sh
 npm install
-npx napi build --platform --release
+npx napi build --platform --release   # emits index.js, index.d.ts and the .node
 node examples/echo.js --selftest
 ```
 
-### Known gap: the generated `index.js`
-
-`napi build --platform` is supposed to emit an `index.js` that picks the right
-platform binary and re-exports it. With `napi`/`napi-derive` 2 and
-`@napi-rs/cli` 3 it emits the `.node` and an empty `index.d.ts`, and no
-`index.js` at all — the CLI reads type metadata the v2 derive macro does not
-write in the shape v3 expects. Adding `features = ["type-def"]` to
-`napi-derive` did not change it.
-
-The addon itself is fine: `require('./ramjet-ws.<platform>-<arch>.node')`
-exports `App` and everything works, which is what `examples/echo.js` does when
-the wrapper is missing. Fixing it properly means either pinning
-`@napi-rs/cli` to 2.x or moving the crate to `napi` 3 — a version decision
-rather than a code one, so it is left for whoever owns the release.
+Built on `napi` 3. The 2.x line is legacy, and `@napi-rs/cli` 3 — what npm
+resolves today — does not emit the JS wrapper for a v2 crate, so a v2 package
+would have shipped with a broken layout and a migration still owed.
 
 ## License
 
