@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # No Windows: the runtime underneath has io_uring and kqueue
+          # backends and no IOCP one, so it does not compile there.
+          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+          # Both Mac targets on Apple Silicon runners. macos-13 (Intel) runners
+          # are scarce and being retired — a sibling project's release once sat
+          # queued 11 minutes for one while every other target finished inside a
+          # minute. Rosetta runs the x86_64 self-test, so it stays tested.
+          - { target: x86_64-apple-darwin,       os: macos-latest }
+          - { target: aarch64-apple-darwin,      os: macos-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+
+      - run: npx napi build --platform --release --target ${{ matrix.target }}
+
+      - name: Self-test
+        # The binding's own protocol suite: text, binary, 128 KiB in one frame,
+        # 128 KiB fragmented, ping/pong, close, and the backpressure bound.
+        # Runs natively, or under Rosetta for x86_64 macOS.
+        run: npm test
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: "*.node"
+          if-no-files-found: error
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt, clippy }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  publish:
+    # Tag-driven, exactly like the runtime's release pipeline: nothing is
+    # published unless a v* tag is pushed and every platform built and passed.
+    needs: [build, lint]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+      - run: npm ci
+
+      - name: Tag must match package.json
+        # A tag that disagrees with the manifest publishes a version whose
+        # binaries claim to be something else. Cheaper to fail here.
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(node -p "require('./package.json').version")
+          echo "tag=$TAG package.json=$PKG"
+          [ "$TAG" = "$PKG" ] || { echo "::error::tag $TAG != package.json $PKG"; exit 1; }
+
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts }
+
+      - name: Assemble platform packages
+        run: |
+          npx napi create-npm-dirs
+          npx napi artifacts --output-dir artifacts
+          ls -la npm/*/
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::notice::NPM_TOKEN not set — skipping publish"
+            exit 0
+          fi
+          # Platform packages first: the root declares them as optional
+          # dependencies, so publishing the root first would briefly point at
+          # versions that do not exist yet. No `|| true` anywhere here — a
+          # publish that half-fails should stop, not leave npm inconsistent.
+          for dir in npm/*/; do
+            (cd "$dir" && npm publish --access public)
+          done
+          npm publish --access public
+
+      - name: GitHub release with the raw binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd artifacts && tar czf ../ramjet-ws-${GITHUB_REF_NAME}-binaries.tar.gz . && cd ..
+          gh release create "${GITHUB_REF_NAME}" \
+            ramjet-ws-${GITHUB_REF_NAME}-binaries.tar.gz \
+            --title "ramjet-ws ${GITHUB_REF_NAME}" \
+            --notes "\`npm install ramjet-ws\` — prebuilt for Linux and macOS on x64 and arm64.
+
+          Built on the [ramjet](https://github.com/sofelia-ai/ramjet) runtime." \
+            --verify-tag
