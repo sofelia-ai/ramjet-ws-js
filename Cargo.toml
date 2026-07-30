@@ -1,6 +1,6 @@
 [package]
 name = "ramjet-ws-js"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Node.js WebSocket server bindings for the ramjet runtime"
