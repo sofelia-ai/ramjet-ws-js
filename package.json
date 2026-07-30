@@ -35,7 +35,8 @@
   "scripts": {
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform",
-    "test": "node examples/echo.js --selftest"
+    "test": "node examples/echo.js --selftest && node examples/leak-test.js",
+    "test:leak": "node examples/leak-test.js"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.7.4"

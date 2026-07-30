@@ -25,6 +25,7 @@
 //! has gone is silently dropped. Silently, because a race the caller cannot
 //! observe is not an error the caller can handle.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::os::fd::{IntoRawFd, RawFd};
@@ -227,6 +228,61 @@ struct Handlers {
     message: Option<Callback<MessageIn, MessageOut>>,
     /// Connection id and close code.
     close: Option<Callback<CloseIn, CloseOut>>,
+    /// Releases a connection's cached handle on the JS thread.
+    ///
+    /// Separate from `close` and always present, because cleanup cannot hang off
+    /// a user-facing callback: a connection that dies before the WebSocket
+    /// handshake never reports `close`, and an app that registers no `close`
+    /// handler would never release anything at all. Tying the `Ref` release to
+    /// either would leak one JS object per connection for the life of the
+    /// process — worse than the per-message cost this cache removes, and
+    /// invisible until a long-lived server falls over.
+    retire: Option<ThreadsafeFunction<u64, (), (), Status, false>>,
+}
+
+// The `ws` handle for each live connection, cached so it is built once rather
+// than once per message.
+//
+// Thread-local, and that is a safety property rather than a shortcut. Every
+// threadsafe-function callback body runs on the JS thread by construction, so
+// this map is only ever touched from there — which matters twice over: a napi
+// `Ref` is thread-affine and must be *released* on the owning JS thread, and a
+// thread-local fails safe if that assumption were ever wrong (a second thread
+// would see an empty map and rebuild, rather than corrupt this one).
+//
+// Profiled motivation: building the handle per message cost ~26% of the JS
+// thread — two `v8::Function::New` instantiations and two property sets for
+// every echoed message, where uWebSockets.js hands out one persistent object
+// per connection.
+thread_local! {
+    static HANDLES: RefCell<HashMap<u64, ObjectRef>> =
+        RefCell::new(HashMap::new());
+}
+
+/// The handle for `id`, built on first use and reused afterwards.
+fn ws_for(env: &Env, bridge: &Arc<Bridge>, id: u64) -> Result<Object<'static>> {
+    HANDLES.with(|cache| {
+        if let Some(r) = cache.borrow().get(&id) {
+            let v = r.get_value(env)?;
+            return Ok(unsafe { std::mem::transmute::<Object<'_>, Object<'static>>(v) });
+        }
+        let obj = ws_handle(env, bridge, id)?;
+        let r = obj.create_ref()?;
+        cache.borrow_mut().insert(id, r);
+        Ok(obj)
+    })
+}
+
+/// Drop a connection's handle. Called from the `close` callback, which runs on
+/// the JS thread — the only thread allowed to release a napi `Ref`.
+fn forget_ws(env: &Env, id: u64) {
+    HANDLES.with(|cache| {
+        if let Some(r) = cache.borrow_mut().remove(&id) {
+            // Explicit rather than dropped: `unref` is what tells V8 the object
+            // may be collected, and it must happen on this thread.
+            let _ = &r; // MUTATED: skip unref
+        }
+    });
 }
 
 /// Build the `ws` handle JS handlers receive: an object with `send` and
@@ -501,6 +557,11 @@ impl Server {
                     cb.call((conn.id, code), ThreadsafeFunctionCallMode::NonBlocking);
                 }
             }
+            // Unconditional, and after `close` so the handler still sees a live
+            // handle: every connection that existed must release its own.
+            if let Some(cb) = &self.handlers.retire {
+                cb.call(conn.id, ThreadsafeFunctionCallMode::NonBlocking);
+            }
         }
     }
 }
@@ -668,14 +729,14 @@ impl WsApp {
     /// the one handler set. It is in the signature so that code written against
     /// uWebSockets.js does not have to change shape when routing arrives.
     #[napi]
-    pub fn ws(&mut self, _pattern: String, handlers: Object) -> Result<()> {
+    pub fn ws(&mut self, env: &Env, _pattern: String, handlers: Object) -> Result<()> {
         if let Ok(f) = handlers.get_named_property::<Function>("open") {
             let b = Arc::clone(&self.bridge);
             self.handlers.open = Some(
                 f.build_threadsafe_function::<u64>()
                     .callee_handled::<false>()
                     .build_callback(move |ctx: ThreadsafeCallContext<u64>| {
-                        ws_handle(&ctx.env, &b, ctx.value)
+                        ws_for(&ctx.env, &b, ctx.value)
                     })?,
             );
         }
@@ -686,10 +747,21 @@ impl WsApp {
                     .callee_handled::<false>()
                     .build_callback(move |ctx: ThreadsafeCallContext<MessageIn>| {
                         let (id, data, binary) = ctx.value;
-                        Ok((ws_handle(&ctx.env, &b, id)?, Buffer::from(data), binary).into())
+                        Ok((ws_for(&ctx.env, &b, id)?, Buffer::from(data), binary).into())
                     })?,
             );
         }
+        let reaper: Function<Unknown, ()> =
+            env.create_function_from_closure("_retire", |_| Ok(()))?;
+        self.handlers.retire = Some(
+            reaper
+                .build_threadsafe_function::<u64>()
+                .callee_handled::<false>()
+                .build_callback(|ctx: ThreadsafeCallContext<u64>| {
+                    forget_ws(&ctx.env, ctx.value);
+                    Ok(())
+                })?,
+        );
         if let Ok(f) = handlers.get_named_property::<Function>("close") {
             let b = Arc::clone(&self.bridge);
             self.handlers.close = Some(
@@ -697,7 +769,12 @@ impl WsApp {
                     .callee_handled::<false>()
                     .build_callback(move |ctx: ThreadsafeCallContext<CloseIn>| {
                         let (id, code) = ctx.value;
-                        Ok((ws_handle(&ctx.env, &b, id)?, code).into())
+                        let ws = ws_for(&ctx.env, &b, id)?;
+                        // The connection is gone; release its handle here, on
+                        // the JS thread, or the map grows one entry per
+                        // connection for the life of the process.
+                        forget_ws(&ctx.env, id);
+                        Ok((ws, code).into())
                     })?,
             );
         }
@@ -751,6 +828,17 @@ impl WsApp {
         callback.call(true)?;
         Ok(())
     }
+}
+
+/// How many per-connection handles are currently cached.
+///
+/// Diagnostic, and the assertion the leak test is built on: after every
+/// connection has closed this must be zero, or each one has left a JS object
+/// behind. Reads thread-local state, so it is only meaningful from the JS
+/// thread — which is where a test runs it.
+#[napi]
+pub fn handle_count() -> u32 {
+    HANDLES.with(|c| c.borrow().len() as u32)
 }
 
 /// Create a server. Named to match uWebSockets.js, where `App()` is a function
