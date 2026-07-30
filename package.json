@@ -1,6 +1,6 @@
 {
   "name": "ramjet-ws",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "WebSocket server for Node.js on the ramjet runtime — io_uring on Linux, kqueue on macOS",
   "main": "index.js",
   "types": "index.d.ts",

@@ -243,7 +243,7 @@ checksum = "1e562390fd88995163e35ff88985c6c9183a2e980442bb4c7ba15c8905c6f9c3"
 
 [[package]]
 name = "ramjet-ws-js"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "libc",
  "napi",
