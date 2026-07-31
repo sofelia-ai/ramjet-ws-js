@@ -12,8 +12,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # The engine, straight from crates.io — the same code the benchmarks measured.
-ramjet = "0.1"
-ramjet-ws = "0.1"
+ramjet = "0.1.3"
+ramjet-ws = "0.1.3"
 libc = "0.2"
 napi = { version = "3", default-features = false, features = ["napi4", "napi6"] }
 napi-derive = "3"

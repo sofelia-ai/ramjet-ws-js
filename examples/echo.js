@@ -9,7 +9,7 @@
 
 const net = require('node:net')
 const crypto = require('node:crypto')
-const { App } = require('../index.js')
+const { App, handleCount } = require('../index.js')
 
 const PORT = Number(process.env.PORT || 9001)
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
@@ -19,6 +19,7 @@ const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 // Set by the backpressure check: when true, a new connection is flooded rather
 // than echoed, so the cap can be observed from the outside.
 let flood = null
+let messageProbe = null
 
 const app = App()
 app.ws('/*', {
@@ -27,6 +28,27 @@ app.ws('/*', {
     if (flood) flood(ws)
   },
   message: (ws, msg, isBinary) => {
+    if (messageProbe) {
+      const probe = messageProbe
+      messageProbe = null
+      if (probe === 'mutate') {
+        msg[1] ^= 0xff
+        ws.send(msg, isBinary)
+        return
+      }
+      if (probe === 'duplicate') {
+        ws.send(msg, isBinary)
+        ws.send(msg, isBinary)
+        return
+      }
+      if (probe === 'retained') {
+        setImmediate(() => {
+          msg[1] ^= 0xff
+          ws.send(msg, isBinary)
+        })
+        return
+      }
+    }
     ws.send(msg, isBinary)
   },
   close: (ws, code) => {
@@ -138,12 +160,20 @@ function connect(port) {
 function next(state) {
   return new Promise((resolve, reject) => {
     const tryParse = () => {
+      state.frames ||= []
+      if (state.frames.length > 0) {
+        state.sock.removeListener('data', onData)
+        state.sock.removeListener('error', reject)
+        resolve(state.frames.shift())
+        return true
+      }
       const [frames, leftover] = parse(state.rest)
       if (frames.length > 0) {
         state.rest = leftover
+        state.frames.push(...frames)
         state.sock.removeListener('data', onData)
         state.sock.removeListener('error', reject)
-        resolve(frames[0])
+        resolve(state.frames.shift())
         return true
       }
       return false
@@ -177,6 +207,31 @@ async function selftest() {
   state.sock.write(frame(0x2, bin))
   got = await next(state)
   check('binary echo (1 KiB)', got.opcode === 0x2 && got.payload.equals(bin))
+
+  // The native boundary uses different storage strategies by message size.
+  // These cases pin down the observable Buffer semantics across that boundary.
+  const original = Buffer.from([0x31, 0x42, 0x53, 0x64])
+  const changed = Buffer.from(original)
+  changed[1] ^= 0xff
+
+  messageProbe = 'mutate'
+  state.sock.write(frame(0x2, original))
+  got = await next(state)
+  check('mutated inbound Buffer is sent with its mutation', got.payload.equals(changed))
+
+  messageProbe = 'duplicate'
+  state.sock.write(frame(0x2, original))
+  const first = await next(state)
+  const second = await next(state)
+  check(
+    'same inbound Buffer can be sent twice',
+    first.payload.equals(original) && second.payload.equals(original),
+  )
+
+  messageProbe = 'retained'
+  state.sock.write(frame(0x2, original))
+  got = await next(state)
+  check('inbound Buffer remains valid after the callback', got.payload.equals(changed))
 
   // One large frame: exercises the 64-bit length path and a payload far larger
   // than a single read.
@@ -231,7 +286,89 @@ async function selftest() {
   })
   check('socket closed', true)
 
+  await oversizedHandshake(check)
+  await nativeEcho(check)
   await backpressure(check)
+}
+
+async function oversizedHandshake(check) {
+  const sock = net.connect(PORT, '127.0.0.1')
+  await new Promise((resolve, reject) => {
+    sock.once('connect', resolve)
+    sock.once('error', reject)
+  })
+  sock.write(Buffer.alloc(20 * 1024, 0x61))
+  const reply = await new Promise((resolve, reject) => {
+    sock.once('data', resolve)
+    sock.once('error', reject)
+  })
+  check('oversized incomplete handshake is rejected', reply.toString().startsWith('HTTP/1.1 400'))
+  sock.destroy()
+}
+
+async function nativeEcho(check) {
+  let conflictRejected = false
+  try {
+    App().ws('/*', { nativeEcho: true, message: () => {} })
+  } catch {
+    conflictRejected = true
+  }
+  check('nativeEcho rejects an ambiguous message handler', conflictRejected)
+
+  let badTypeRejected = false
+  try {
+    App().ws('/*', { nativeEcho: 'yes' })
+  } catch {
+    badTypeRejected = true
+  }
+  check('nativeEcho requires a boolean', badTypeRejected)
+
+  const port = PORT + 1
+  const app = App()
+  app.ws('/*', { nativeEcho: true })
+  await new Promise((resolve, reject) => {
+    app.listen(port, (ok) => (ok ? resolve() : reject(new Error('native echo bind failed'))))
+  })
+
+  const state = await connect(port)
+  state.sock.write(frame(0x1, Buffer.from('native text')))
+  let got = await next(state)
+  check('native text echo', got.opcode === 0x1 && got.payload.toString() === 'native text')
+
+  const batchText = Buffer.from('corked native batch')
+  const batchBinary = crypto.randomBytes(256)
+  state.sock.write(Buffer.concat([frame(0x1, batchText), frame(0x2, batchBinary)]))
+  const batchFirst = await next(state)
+  const batchSecond = await next(state)
+  check(
+    'native pipelined text and binary echo in order',
+    batchFirst.opcode === 0x1 &&
+      batchFirst.payload.equals(batchText) &&
+      batchSecond.opcode === 0x2 &&
+      batchSecond.payload.equals(batchBinary),
+  )
+
+  // A 64 KiB payload plus its masked header straddles Ramjet's pooled-buffer
+  // boundary, pinning the streaming fallback as well as the in-place path.
+  const boundary = crypto.randomBytes(64 * 1024)
+  state.sock.write(frame(0x2, boundary))
+  got = await next(state)
+  check(
+    'native binary echo (64 KiB pool boundary)',
+    got.opcode === 0x2 && got.payload.equals(boundary),
+  )
+
+  const binary = crypto.randomBytes(128 * 1024)
+  state.sock.write(frame(0x2, binary))
+  got = await next(state)
+  check('native binary echo (128 KiB)', got.opcode === 0x2 && got.payload.equals(binary))
+
+  const code = Buffer.alloc(2)
+  code.writeUInt16BE(1000)
+  state.sock.write(frame(0x8, code))
+  got = await next(state)
+  check('native echo close', got.opcode === 0x8 && got.payload.readUInt16BE(0) === 1000)
+  state.sock.destroy()
 }
 
 /// The cap is only real if it is observed. A client that never reads makes the
@@ -297,4 +434,13 @@ async function backpressure(check) {
     `rss grew ${((after - before) / 1048576).toFixed(1)} MiB while idle at the cap`,
   )
   sock.destroy()
+
+  // Let the ordered close event release the cached handle before forcing the
+  // process down. Otherwise napi correctly warns about an ObjectRef that the
+  // test itself did not give the dispatcher time to unref.
+  const deadline = Date.now() + 1500
+  while (handleCount() !== 0 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 10))
+  }
+  check('all handles released before shutdown', handleCount() === 0)
 }

@@ -7,11 +7,13 @@ around `net`: the socket layer never enters JavaScript.
 ```js
 const { App } = require('ramjet-ws')
 
-App().ws('/*', {
+const app = App()
+app.ws('/*', {
   open:    (ws)                  => console.log('open'),
   message: (ws, msg, isBinary)   => ws.send(msg, isBinary),
   close:   (ws, code)            => console.log('closed', code),
-}).listen(9001, (ok) => {
+})
+app.listen(9001, (ok) => {
   if (ok) console.log('listening on 9001')
 })
 ```
@@ -53,6 +55,7 @@ surprised.
 | `behavior.open(ws)` | connection established |
 | `behavior.message(ws, msg, isBinary)` | `msg` is a `Buffer` |
 | `behavior.close(ws, code)` | connection gone |
+| `behavior.nativeEcho` | set to `true` to echo frames entirely in the native reactor; mutually exclusive with `message` |
 | `ws.send(data, isBinary)` | `data` may be a string or `Buffer`; returns `false` if the message was dropped because the connection is at its 4 MiB outbound cap |
 | `ws.close()` | close it |
 
@@ -61,6 +64,26 @@ Outbound buffering is capped per connection at 4 MiB, and `ws.send` returns
 peer that stops reading; it is not the full backpressure contract — there is no
 `drain` event yet, so a producer that wants to resume has to retry rather than be
 told when there is room.
+
+Decoded messages waiting to cross from the native reactor into JavaScript have
+a 32 MiB high-water mark per app. At most one reactor completion batch may sit
+above it so a maximum-sized message can make progress. If JavaScript falls
+behind, the reactor pauses reads and lets TCP flow control push back on clients
+instead of growing an unbounded cross-thread queue.
+
+For echo servers, `nativeEcho: true` removes the message path through V8. A
+whole frame is echoed from its pooled receive buffer without moving the
+payload; pipelined frames are unmasked, compacted, and corked into one write:
+
+```js
+const app = App()
+app.ws('/*', { nativeEcho: true })
+app.listen(9001, (ok) => console.log(ok ? 'listening' : 'bind failed'))
+```
+
+This mode deliberately does not invoke `behavior.message`. Open and close
+handlers may still be registered. A peer that fills the 4 MiB outbound cap is
+closed rather than allowing the native echo queue to grow without bound.
 
 Not implemented yet: pub/sub, `drain`/backpressure signalling, HTTP routing, TLS
 termination, and per-message compression. The Rust runtime supports TLS; the
